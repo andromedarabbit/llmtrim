@@ -16,7 +16,116 @@ All notable changes to this project are documented here. The format follows
   (removing an entry takes effect on the next rebuild), duplicate certificate
   blocks are deduplicated, and unreadable entries are skipped with a warning.
 
+## [0.13.7] - 2026-09-16
+
+### Fixed
+
+- **DeepSeek dollars follow the published list again.** `deepseek-flash` replaced
+  `deepseek-v4-flash`, the retired ids still bill at Flash prices, and a cache hit is
+  billed at its own $0.003/1M tier instead of a fraction of the miss rate. Peak
+  (Beijing 09:00-12:00 / 14:00-18:00) still costs 2x off-peak and weekends stay
+  off-peak all day, but cache writes now bill as miss input rather than zero, and
+  DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` are read, so the
+  hit/miss split reaches the bill instead of pricing the whole prompt at the miss rate.
+- **`/sub` starts again on Claude Code resume.** Switching away (`/resume`, or
+  `--resume` of another session) treated `SessionEnd(reason=resume)` as a logout
+  and minted a fresh empty window on the way back, so window-local subscription
+  routing did not start again for that session id. Resume now reattaches the
+  same window and intent.
+- **`llmtrim wrap` launches npm shims on Windows.** `dsh`, `tsc`, and any other CLI npm
+  installs as a `.cmd`/`.ps1` shim now start correctly: the shim the shell would run is
+  resolved in PATHEXT order, `.cmd`/`.bat` are handed to Rust's own batch handling (which
+  escapes their arguments and refuses ones it cannot escape), and `.ps1` goes through
+  PowerShell. Previously a shim's arguments were silently dropped, and a `.cmd` could
+  shadow a native `.exe` of the same name.
+
+## [0.13.6] - 2026-09-15
+
+### Fixed
+
+- **Source-file tool results are no longer windowed.** Claude Code `Read` (and
+  equivalent dumps: guttered `cat -n`, TypeScript, Rust, Java) was classified as a
+  log because identifiers such as `Exception` / `Error` / `info` matched
+  anywhere in the line, or else fell through to plaintext fold+window. The model
+  then re-read in ~20-line slices. Log detection now requires a line-start level
+  token; source-shaped dumps (gutter or indent/punctuation density) skip toolout
+  entirely. Logs, diffs, and grep still window. (#289)
+
+## [0.13.5] - 2026-09-15
+
 ### Changed
+
+- **Interceptor replay/fallback no longer pins blocking threads.** Secondary upstream
+  POSTs (400/422 replay, `sub` fallback, compact candidates, transport retries) use
+  the same async HTTP stack as the MITM path, with a 600s timeout, so a hung stream
+  cannot exhaust tokio's blocking pool. (#291)
+
+- **HTTP/2 to the origin through `LLMTRIM_UPSTREAM_PROXY`.** CONNECT-tunnelled TLS
+  now advertises `h2` alongside HTTP/1.1 so concurrent streams can multiplex on the
+  origin connection. (#291)
+
+### Fixed
+
+- **MITM certs are canonical low-S ECDSA.** `ring` / rustls-webpki reject high-S
+  P-256 signatures (OpenSSL and Node normalize them). The local CA and each
+  intercepted leaf are re-signed until `s ≤ n/2`, a high-S CA on disk is
+  reissued, and the proxy's TLS server signs `CertificateVerify` with rustls'
+  `ring` provider after canonicalizing `s`. (#290)
+
+- **Windows tray popover stays on screen.** Opening the dashboard from the
+  notification area centred a 360px window on the tray icon, so about a
+  quarter of it sat past the right edge of the monitor and could not be
+  dragged back. Positioning now clamps to the screen; if the icon location is
+  not yet known, the window opens at the bottom-right instead of at (0, 0).
+  (#287)
+
+## [0.13.4] - 2026-09-08
+
+### Added
+
+- **Tool-output passthrough for machine couriers.** Long tool results are still
+  windowed by default (head + errors + `llmtrim recall`), which drops a terminal
+  trailer such as `LANE_DELIVERY job=… sha256=…` and breaks attesters that bind
+  the courier's delivered text. A result now ships byte-identical — no ANSI strip,
+  no window, no recall pointer — when any of these hold: the producing command
+  matches `toolout_passthrough` globs (`*` = all), the command assigns
+  `LLMTRIM_TOOL_OUTPUT=passthrough`, or a line of the result is that assignment.
+  Env `LLMTRIM_TOOL_OUTPUT` (same values) overlays the file key so it coexists
+  with `preset = "agent"`. Lines starting with `LLMTRIM_KEEP:` are force-kept
+  when windowing still runs. (#281)
+
+### Changed
+
+- **First-arrival tool-output recall is off by default.** Cache-boundary tool results
+  were shaped Aggressive (errors-only / `+/-` only) and recovered via `llmtrim recall`,
+  which the agent often cannot run (PATH, sandbox, in-memory store). Frozen prefixes
+  then kept the skeleton for the rest of the session. Live-zone log/diff/grep windowing
+  is unchanged; re-run the tool to get the full result. Opt in with
+  `first_arrival_recall = true` or `LLMTRIM_FIRST_ARRIVAL_RECALL=true`.
+
+### Fixed
+
+- **Windows tray Start proxy no longer spins forever.** Clicking Start proxy flashed
+  a PowerShell window, left `HTTPS_PROXY` wired, and never left the loading state
+  because the tray waited on pipes the daemon still held and the daemon blocked on
+  `WM_SETTINGCHANGE` before binding. Env broadcast is now windowless and
+  non-blocking, `start` fails (and unwires) if the port never accepts, and the tray
+  shows an error instead of spinning. (#272)
+
+- **Claude Code voice dictation works through the proxy.** The interceptor refused
+  every WebSocket upgrade to an intercepted host with `426` so Codex would fall
+  back to compressible HTTPS. Claude Code's speech-to-text socket
+  (`wss://api.anthropic.com/api/ws/speech_to_text/voice_stream`) has no HTTPS
+  fallback, so the microphone died. Non-prompt WebSockets are now forwarded;
+  Codex `/responses` still gets `426`. (#282)
+
+## [0.13.3] - 2026-09-01
+
+### Changed
+
+- **Dependencies.** MITM proxy crate `hudsucker` 0.25 (SNI hostnames plus key-usage/AKI on
+  generated certificates), `comfy-table` 8 for status/eval tables, `actions/setup-java` v6
+  for Kotlin CI, and cargo patch updates including `rmcp` 3.1.4.
 
 - **Statusline, cold-cache guard, and cheaper `/compact` are off by default.** `setup` /
   `ensure` no longer first-install them. New machines get `/sub` (and routed subagents)
@@ -1686,7 +1795,12 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.7...HEAD
+[0.13.7]: https://github.com/fkiene/llmtrim/compare/v0.13.6...v0.13.7
+[0.13.6]: https://github.com/fkiene/llmtrim/compare/v0.13.5...v0.13.6
+[0.13.5]: https://github.com/fkiene/llmtrim/compare/v0.13.4...v0.13.5
+[0.13.4]: https://github.com/fkiene/llmtrim/compare/v0.13.3...v0.13.4
+[0.13.3]: https://github.com/fkiene/llmtrim/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/fkiene/llmtrim/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/fkiene/llmtrim/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/fkiene/llmtrim/compare/v0.12.6...v0.13.0

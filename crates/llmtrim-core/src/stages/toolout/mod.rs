@@ -17,8 +17,9 @@
 //! drop policy is one shared recipe — fold losslessly first, ship that if it fits, else
 //! window under an adaptive budget (`crate::stages::sizing`) with dropped runs
 //! becoming positional elision markers (`[… N lines omitted …]`, like the `retrieve`
-//! stage) — plus three universal rails that apply to every windowed segment, current
-//! and future kinds alike:
+//! stage) — plus universal rails that apply to every windowed segment, current
+//! and future kinds alike. **Source-shaped dumps are not a kind:** they decline this
+//! stage (no log window, no plaintext window) so a file Read stays intact (#289).
 //!
 //! 1. **Attribution** (`rebuild`): windowed output opens with a self-identifying
 //!    header naming llmtrim and the recovery action, so an agent never misattributes
@@ -33,9 +34,16 @@
 //!    conclude the tool itself is broken.
 //! 3. **Never inflate** (`elide_into`): an elision marker is emitted only when it is
 //!    shorter than the lines it hides; a lone `--` separator survives as itself.
+//! 4. **Command / sentinel passthrough** (#281): a result whose producing command
+//!    matches `toolout_passthrough` globs, whose command assigns
+//!    `LLMTRIM_TOOL_OUTPUT=passthrough`, or which contains that assignment as a
+//!    line, skips normalize, windowing, and the recall trailer — stdout stays
+//!    byte-identical for machine couriers.
+//! 5. **Keep-prefix** (#281): lines starting with `LLMTRIM_KEEP:` are force-kept
+//!    wherever windowing still runs (including errors-only).
 //!
 //! Live-zone windowing is lossy. First-arrival cache-boundary results receive recoverable
-//! windowing by default on auto-routed agent requests: an admitted result gets an opaque recall
+//! windowing only when `first_arrival_recall` is on: an admitted result gets an opaque recall
 //! handle, while its raw bytes live only in the daemon memory store for five hours by default.
 //! When recovery is disabled or admission fails, the boundary receives terminal-equivalent
 //! normalization only. Without an admission hint, template folding and lossy
@@ -54,6 +62,7 @@ mod generated;
 mod grep;
 mod log;
 mod normalize;
+mod passthrough;
 mod plaintext;
 pub(crate) mod signals;
 mod template;
@@ -183,6 +192,23 @@ impl Transform for ToolOutputStage {
             template: self.template,
             mode: self.mode,
         };
+        let commands = passthrough::commands_by_id(req.raw());
+        let patterns = req.toolout_passthrough();
+        let exempt: HashSet<String> = first_arrival
+            .iter()
+            .chain(pointers.iter())
+            .filter(|p| {
+                req.get_str(p).is_some_and(|raw| {
+                    passthrough::should_passthrough(
+                        raw,
+                        passthrough::command_for(&commands, req.raw(), p),
+                        patterns,
+                    )
+                })
+            })
+            .cloned()
+            .collect();
+
         // A durable raw copy changes the boundary trade-off: prefer signal-only selection
         // (Aggressive) where the kind supports it, under the same line budget as live-zone
         // shaping. The model can recover exact omitted bytes instead of carrying a cautious
@@ -207,6 +233,10 @@ impl Transform for ToolOutputStage {
             let Some(raw) = req.get_str(&pointer) else {
                 continue;
             };
+            if exempt.contains(&pointer) {
+                // Verbatim: no ANSI strip, no window, no recall pointer (#281).
+                continue;
+            }
             if let Some(handle) = req.recovery_hint(&pointer)
                 && let Some(shaped) = shape_lossy(raw, &recovery_ctx, &query, self.min_lines)
             {
@@ -267,6 +297,9 @@ impl Transform for ToolOutputStage {
             let Some((text, normalized)) = text else {
                 continue;
             };
+            if exempt.contains(ptr) {
+                continue;
+            }
             if text.lines().count() < self.min_lines || repeats.contains(ptr) {
                 // Too small to window — or a repeated invocation the agent made to get
                 // the full output back (passthrough). Either way no windowing; still
@@ -313,7 +346,14 @@ fn compress_shaped(
         Some(OutKind::Log) => log::compress(text, ctx, query),
         Some(OutKind::Grep) => grep::compress(text, ctx, query),
         Some(OutKind::Diff) => diff::compress(text, ctx, query),
-        None => generated::compress(text).or_else(|| plaintext::compress(text, ctx, query)),
+        // Lockfiles/minified still elide. Ordinary source must not be plaintext-windowed (#289).
+        None => generated::compress(text).or_else(|| {
+            if detect::is_source_dump(text) {
+                None
+            } else {
+                plaintext::compress(text, ctx, query)
+            }
+        }),
     }
 }
 
@@ -399,6 +439,17 @@ pub(crate) fn select_keep(scores: &[f64], k: usize, force: f64) -> Vec<bool> {
     }
     fill_by_score(&mut keep, scores, k);
     keep
+}
+
+/// Force-keep documented [`passthrough::KEEP_PREFIX`] lines. Errors already exceed
+/// budget via [`FORCE_PRIORITY`]; keep-prefix lines do the same without counting as
+/// failures in the log census.
+pub(crate) fn pin_keep_lines(keep: &mut [bool], lines: &[&str]) {
+    for (slot, line) in keep.iter_mut().zip(lines) {
+        if passthrough::is_keep_line(line) {
+            *slot = true;
+        }
+    }
 }
 
 /// Replace a dropped run of lines with a positional elision marker — dropped content is

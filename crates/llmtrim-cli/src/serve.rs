@@ -72,6 +72,10 @@ mod imp {
     use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
     use hyper_http_proxy::{Intercept, Proxy as UpstreamProxy, ProxyConnector};
     use hyper_util::client::legacy::connect::HttpConnector;
+    use rustls::crypto::KeyProvider;
+    use rustls::crypto::ring as rustls_ring;
+    use rustls::sign::{Signer, SigningKey};
+    use rustls::{SignatureAlgorithm, SignatureScheme};
 
     use crate::tracking::{Record, Tracker};
     use llmtrim_core::config::{DenseConfig, RuntimeConfig};
@@ -318,23 +322,36 @@ mod imp {
         (out.len() as u64 <= MAX_DECODED).then_some(out)
     }
 
+    /// HTTP/2 Extended CONNECT with `:protocol: websocket` (RFC 8441). hudsucker treats
+    /// CONNECT as an HTTP tunnel, so these must be refused rather than forwarded.
+    fn is_h2_websocket_connect(req: &Request<Body>) -> bool {
+        req.method() == Method::CONNECT
+            && req
+                .extensions()
+                .get::<hudsucker::hyper::ext::Protocol>()
+                .is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+    }
+
     /// True if `req` is a WebSocket upgrade attempt — either an HTTP/1.1 `Upgrade: websocket`
-    /// handshake or an HTTP/2 Extended CONNECT (RFC 8441, the `:protocol` pseudo-header set to
-    /// `websocket`). We refuse these on intercepted LLM hosts (see `handle_request_inner`): a
-    /// WebSocket carries the prompt as frames, not an HTTP body, so llmtrim can't compress it,
-    /// and hudsucker can't forward an h2 Extended CONNECT anyway — it stalls until the client
-    /// times out. Refusing fast makes the client fall back to the plain-HTTPS transport, which
-    /// is a normal POST body llmtrim *does* compress. OpenAI's Codex is the motivating client.
+    /// handshake or an HTTP/2 Extended CONNECT. See [`should_refuse_websocket`] for which of
+    /// these are refused vs forwarded.
     fn is_websocket_upgrade(req: &Request<Body>) -> bool {
-        if req.method() == Method::CONNECT
-            && let Some(p) = req.extensions().get::<hudsucker::hyper::ext::Protocol>()
-        {
-            return p.as_str().eq_ignore_ascii_case("websocket");
-        }
-        req.headers()
-            .get(header::UPGRADE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        is_h2_websocket_connect(req)
+            || req
+                .headers()
+                .get(header::UPGRADE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+    }
+
+    /// True when an intercepted WebSocket must be refused with 426 rather than forwarded.
+    /// Prompt-bearing routes (Codex `/responses`) have an HTTPS fallback llmtrim can compress;
+    /// h2 Extended CONNECT cannot be forwarded by hudsucker. Everything else — notably Claude
+    /// Code voice dictation at `/api/ws/speech_to_text/voice_stream` — is passed through so
+    /// hudsucker can tunnel it.
+    fn should_refuse_websocket(req: &Request<Body>) -> bool {
+        is_websocket_upgrade(req)
+            && (is_h2_websocket_connect(req) || is_compressible_path(req.uri().path()))
     }
 
     /// Host of a request: the URI authority, else the `Host` header (port stripped).
@@ -584,17 +601,14 @@ mod imp {
 
     /// Send the original (uncompressed) request to the upstream and buffer the reply. `None` if
     /// the round-trip itself fails.
-    fn fetch_original(
+    async fn fetch_original_with(
+        http: &BufferedHttp,
         orig: &OriginalRequest,
-        proxy_url: Option<&str>,
     ) -> Option<(u16, Option<String>, Vec<u8>)> {
-        use std::io::Read;
-        let body = std::str::from_utf8(&orig.body).ok()?;
-        let mut up =
-            crate::transport::forward_post(&orig.url, &orig.headers, body, proxy_url).ok()?;
-        let mut buf = Vec::new();
-        up.reader.read_to_end(&mut buf).ok()?;
-        Some((up.status, up.content_type, buf))
+        let (status, content_type, _retry_after, buf) = http
+            .post(&orig.url, &orig.headers, orig.body.clone())
+            .await?;
+        Some((status, content_type, buf))
     }
 
     /// Build a client response from a buffered upstream reply.
@@ -615,8 +629,11 @@ mod imp {
     /// Replay the original (uncompressed) request to the upstream — direct, all statuses
     /// relayed — and build a response for the client. `None` if the replay itself fails (in
     /// which case the caller keeps the compressed response's error).
-    fn replay_original(orig: &OriginalRequest, proxy_url: Option<&str>) -> Option<Response<Body>> {
-        let (status, content_type, body) = fetch_original(orig, proxy_url)?;
+    async fn replay_original_with(
+        http: &BufferedHttp,
+        orig: &OriginalRequest,
+    ) -> Option<Response<Body>> {
+        let (status, content_type, body) = fetch_original_with(http, orig).await?;
         Some(buffered_response(status, content_type, body))
     }
 
@@ -1492,6 +1509,166 @@ mod imp {
         client
     }
 
+    /// Origin-leg rustls config: verifying roots + ALPN `h2` then `http/1.1`.
+    ///
+    /// `hyper-http-proxy`'s default `TlsConnector` builds a `ClientConfig` with **no** ALPN, so
+    /// CONNECT-tunnelled origins negotiate HTTP/1.1 only. Setting ALPN here is what lets concurrent
+    /// streams multiplex on one TLS session when `LLMTRIM_UPSTREAM_PROXY` is set.
+    fn origin_tls_client_config() -> Result<hudsucker::rustls::ClientConfig> {
+        let builder = hudsucker::rustls::ClientConfig::builder_with_provider(Arc::new(
+            aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .context("failed to configure origin TLS protocol versions")?;
+        #[cfg(windows)]
+        let builder = builder.with_root_certificates(windows_root_store()?);
+        #[cfg(not(windows))]
+        let builder = builder.with_root_certificates(unix_native_root_store()?);
+        Ok(builder.with_no_client_auth())
+    }
+
+    fn origin_tls_client_config_with_alpn() -> Result<hudsucker::rustls::ClientConfig> {
+        let mut cfg = origin_tls_client_config()?;
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(cfg)
+    }
+
+    #[cfg(not(windows))]
+    fn unix_native_root_store() -> Result<hudsucker::rustls::RootCertStore> {
+        let mut roots = hudsucker::rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        for cert in native.certs {
+            let _ = roots.add(cert);
+        }
+        if roots.is_empty() {
+            anyhow::bail!("no native TLS roots found for origin connections");
+        }
+        Ok(roots)
+    }
+
+    fn direct_https_connector() -> Result<hyper_rustls::HttpsConnector<HttpConnector>> {
+        Ok(hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(origin_tls_client_config()?)
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build())
+    }
+
+    fn upstream_proxy_connector(upstream_url: &str) -> Result<ProxyConnector<HttpConnector>> {
+        let upstream_uri = upstream_url
+            .parse::<hudsucker::hyper::Uri>()
+            .with_context(|| {
+                format!(
+                    "failed to parse upstream proxy URI `{}`",
+                    crate::transport::redact_proxy_url(upstream_url)
+                )
+            })?;
+        let spec = UpstreamProxy::new(Intercept::All, upstream_uri);
+        let mut connector = ProxyConnector::from_proxy(HttpConnector::new(), spec)
+            .map_err(|e| anyhow::anyhow!("failed to build upstream ProxyConnector: {e}"))?;
+        connector.set_tls(Some(tokio_rustls::TlsConnector::from(Arc::new(
+            origin_tls_client_config_with_alpn()?,
+        ))));
+        Ok(connector)
+    }
+
+    /// Headers that must not be forwarded on HTTP/2 (RFC 9113) or that the HTTP client sets.
+    fn is_hop_by_hop_header(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "trailer"
+                | "host"
+                | "content-length"
+        )
+    }
+
+    /// Buffered POST used by replay / fallback / compact / transport retry. Async so a slow SSE
+    /// generation cannot pin a `spawn_blocking` thread for up to [`crate::transport::UPSTREAM_TIMEOUT`].
+    async fn buffered_post<C>(
+        client: &hyper_util::client::legacy::Client<C, Full<Bytes>>,
+        url: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+    ) -> Option<(u16, Option<String>, Option<String>, Vec<u8>)>
+    where
+        C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+    {
+        let mut builder = Request::builder().method(Method::POST).uri(url);
+        for (k, v) in headers {
+            if is_hop_by_hop_header(k) {
+                continue;
+            }
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        let req = builder.body(Full::new(Bytes::from(body))).ok()?;
+        let fut = async {
+            let res = client.request(req).await.ok()?;
+            let status = res.status().as_u16();
+            let content_type = res
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let retry_after = res
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = res.into_body().collect().await.ok()?.to_bytes().to_vec();
+            Some((status, content_type, retry_after, body))
+        };
+        tokio::time::timeout(crate::transport::UPSTREAM_TIMEOUT, fut)
+            .await
+            .ok()?
+    }
+
+    /// Secondary HTTP client for interceptor paths that buffer the upstream body (not the MITM
+    /// hot path). Same pool/idle settings as the outbound MITM client.
+    #[derive(Clone)]
+    enum BufferedHttp {
+        Direct(
+            hyper_util::client::legacy::Client<
+                hyper_rustls::HttpsConnector<HttpConnector>,
+                Full<Bytes>,
+            >,
+        ),
+        Proxied(hyper_util::client::legacy::Client<ProxyConnector<HttpConnector>, Full<Bytes>>),
+    }
+
+    impl BufferedHttp {
+        fn new(proxy_url: Option<&str>) -> Result<Self> {
+            let _ = aws_lc_rs::default_provider().install_default();
+            Ok(match proxy_url {
+                Some(url) => Self::Proxied(
+                    outbound_client_builder()
+                        .build::<_, Full<Bytes>>(upstream_proxy_connector(url)?),
+                ),
+                None => Self::Direct(
+                    outbound_client_builder().build::<_, Full<Bytes>>(direct_https_connector()?),
+                ),
+            })
+        }
+
+        async fn post(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            body: Vec<u8>,
+        ) -> Option<(u16, Option<String>, Option<String>, Vec<u8>)> {
+            match self {
+                Self::Direct(c) => buffered_post(c, url, headers, body).await,
+                Self::Proxied(c) => buffered_post(c, url, headers, body).await,
+            }
+        }
+    }
+
     /// Read Windows roots directly instead of going through `rustls-native-certs`, whose
     /// `SSL_CERT_FILE`/`SSL_CERT_DIR` precedence can hide the OS store in an inherited shell.
     #[cfg(windows)]
@@ -1539,20 +1716,7 @@ mod imp {
     /// the Windows stores instead of Mozilla's public-only roots or environment-selected bundles.
     #[cfg(windows)]
     fn windows_native_roots_connector() -> Result<hyper_rustls::HttpsConnector<HttpConnector>> {
-        let tls_config = hudsucker::rustls::ClientConfig::builder_with_provider(Arc::new(
-            aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .context("failed to configure Windows upstream TLS protocol versions")?
-        .with_root_certificates(windows_root_store()?)
-        .with_no_client_auth();
-
-        Ok(hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build())
+        direct_https_connector()
     }
 
     /// Per-source attribution attached to a `Pending` for the breakdown view: the parsed
@@ -1825,10 +1989,9 @@ mod imp {
         /// `handle_error` so a transport failure is reported in the shape the client parses).
         /// Per-request: the handler is cloned per request, like `pending`.
         streaming: bool,
-        /// Optional upstream proxy URL from `LLMTRIM_UPSTREAM_PROXY`. Used by the replay path
-        /// (`forward_post`). The primary MITM interception path honours this setting via the
-        /// `ProxyConnector` built at startup (see the `start` function in this module).
-        upstream_proxy: Option<String>,
+        /// Async HTTP client for buffered secondary upstream POSTs (replay, fallback, compact).
+        /// Honours `LLMTRIM_UPSTREAM_PROXY` the same way the MITM `ProxyConnector` does.
+        http: BufferedHttp,
         /// User opt-out lists (`exclude_hosts` / `exclude_providers`), snapshotted from
         /// [`RuntimeConfig`] at construction like `domains` above: a request matching either is
         /// forwarded verbatim (still intercepted, just not compressed).
@@ -1879,7 +2042,11 @@ mod imp {
     impl HttpHandler for Interceptor {
         /// Only MITM (forge a cert for) the LLM provider hosts; everything else is
         /// blind-tunneled, so the CA is never used outside its purpose.
-        async fn should_intercept(&mut self, _ctx: &HttpContext, req: &Request<Body>) -> bool {
+        async fn should_intercept_connect(
+            &mut self,
+            _ctx: &HttpContext,
+            req: &Request<Body>,
+        ) -> bool {
             host_of(req)
                 .map(|h| host_covered(&h.to_ascii_lowercase(), &self.domains))
                 .unwrap_or(false)
@@ -1959,12 +2126,8 @@ mod imp {
                     log_upstream_transport_failure(self.pending.as_ref(), &cause, "retry-failed");
                 } else if let Some(original) = pending.original.clone() {
                     log_upstream_transport_failure(self.pending.as_ref(), &cause, "retry");
-                    let proxy = self.upstream_proxy.clone();
-                    let fetched = tokio::task::spawn_blocking(move || {
-                        fetch_original(&original, proxy.as_deref())
-                    })
-                    .await;
-                    if let Ok(Some((status, content_type, body))) = fetched {
+                    let fetched = fetch_original_with(&self.http, &original).await;
+                    if let Some((status, content_type, body)) = fetched {
                         let pending = self.pending.take().expect("pending present above");
                         if (200..300).contains(&status) {
                             note_session_accepted(&pending);
@@ -2038,16 +2201,20 @@ mod imp {
         /// constructing a `hudsucker::HttpContext` (which is `#[non_exhaustive]` and
         /// cannot be instantiated outside the hudsucker crate).
         async fn handle_request_inner(&mut self, req: Request<Body>) -> RequestOrResponse {
-            // Refuse WebSocket upgrades on intercepted hosts so the client drops to the
-            // compressible plain-HTTPS transport (see `is_websocket_upgrade`). 426 Upgrade
-            // Required is a clean, immediate handshake failure — no body, no hang — so the
-            // client falls back at once instead of retrying the dead upgrade for seconds.
-            if is_websocket_upgrade(&req) {
+            // WebSockets on intercepted hosts: refuse prompt-bearing upgrades (Codex
+            // `/responses`) with 426 so the client drops to compressible HTTPS; refuse h2
+            // Extended CONNECT (hudsucker can't forward it). Other sockets — Claude Code
+            // dictation on `/api/ws/` — have no HTTPS fallback, so pass them through for
+            // hudsucker to tunnel. Return before dummy-auth stubs so dictation is not eaten.
+            if should_refuse_websocket(&req) {
                 let res = Response::builder()
                     .status(hudsucker::hyper::StatusCode::UPGRADE_REQUIRED)
                     .body(Body::empty())
                     .expect("static 426 response is always valid");
                 return RequestOrResponse::Response(res);
+            }
+            if is_websocket_upgrade(&req) {
+                return req.into();
             }
             // Lowercase the host once: every host comparison below (Vertex suffix, provider
             // lookup, exclusion match) is case-insensitive.
@@ -3487,33 +3654,20 @@ mod imp {
             }
         }
 
-        /// Re-issue a rerouted upstream request (blocking, buffered `forward_post` like the replay
-        /// net) for a retry attempt. Returns `(status, body, reset-hint-seconds)`, or `None` if the
-        /// round-trip or its task failed (the caller stops retrying and surfaces the last error).
+        /// Re-issue a rerouted upstream request (buffered, like the replay net) for a retry
+        /// attempt. Returns `(status, body, reset-hint-seconds)`, or `None` if the round-trip
+        /// failed (the caller stops retrying and surfaces the last error).
         async fn reissue_reroute(
             &self,
             url: &str,
             headers: Vec<(String, String)>,
             body: Arc<Vec<u8>>,
         ) -> Option<(u16, Vec<u8>, Option<u64>)> {
-            let url = url.to_string();
-            let proxy = self.upstream_proxy.clone();
-            // `forward_post` exposes no response headers, so a retried attempt's reset hint comes
-            // from the body (`resets_in_seconds`) — enough for the Codex/Kimi usage-limit shape.
-            let (status, raw) = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                let body_str = String::from_utf8_lossy(&body);
-                let mut up =
-                    crate::transport::forward_post(&url, &headers, &body_str, proxy.as_deref())
-                        .map_err(|e| e.to_string())?;
-                let mut buf = Vec::new();
-                up.reader.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-                Ok::<(u16, Vec<u8>), String>((up.status, buf))
-            })
-            .await
-            .ok()?
-            .ok()?;
-            let retry_after = reroute_retry_after_secs(None, None, &raw);
+            // Response headers besides retry-after are unused; a retried attempt's reset hint
+            // also comes from the body (`resets_in_seconds`) for the Codex/Kimi usage-limit shape.
+            let (status, _ct, retry_after_hdr, raw) =
+                self.http.post(url, &headers, body.as_ref().clone()).await?;
+            let retry_after = reroute_retry_after_secs(retry_after_hdr.as_deref(), None, &raw);
             Some((status, raw, retry_after))
         }
 
@@ -3625,7 +3779,7 @@ mod imp {
                 }
                 if crate::reroute::cliproxy::is_anthropic_hop(&hop) {
                     if let Some(orig) = pending.original.as_ref()
-                        && let Some(res) = replay_original(orig, self.upstream_proxy.as_deref())
+                        && let Some(res) = replay_original_with(&self.http, orig).await
                     {
                         if res.status().as_u16() < 400 {
                             return res;
@@ -3772,28 +3926,14 @@ mod imp {
             let url = rewrite.url();
             let headers = rewrite.headers.clone();
             let body = String::from_utf8_lossy(&sent_body).into_owned();
-            let proxy = self.upstream_proxy.clone();
             let mut attempt = 0;
             loop {
-                let url = url.clone();
-                let headers = headers.clone();
-                let body = body.clone();
-                let proxy = proxy.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    use std::io::Read;
-                    let mut up =
-                        crate::transport::forward_post(&url, &headers, &body, proxy.as_deref())
-                            .map_err(|e| e.to_string())?;
-                    let mut buf = Vec::new();
-                    up.reader.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-                    let retry_after =
-                        reroute_retry_after_secs(up.retry_after.as_deref(), None, &buf);
-                    Ok::<(u16, Vec<u8>, Option<u64>), String>((up.status, buf, retry_after))
-                })
-                .await
-                .map_err(|_| "fallback task failed".to_string())?
-                .map_err(|e| format!("request failed: {e}"))?;
-                let (status, body, retry_after) = result;
+                let (status, _ct, retry_after_hdr, body) = self
+                    .http
+                    .post(&url, &headers, body.clone().into_bytes())
+                    .await
+                    .ok_or_else(|| "request failed".to_string())?;
+                let retry_after = reroute_retry_after_secs(retry_after_hdr.as_deref(), None, &body);
                 if (200..300).contains(&status) {
                     return Ok(FallbackAttempt {
                         provider,
@@ -3831,32 +3971,30 @@ mod imp {
         /// One bounded retry of the turn against Anthropic before the chain takes over. A 503 or a
         /// short 429 is usually a blip, and a blip should not move a turn (and its spend) to a
         /// different provider. Returns the `Pending` back when no retry was possible or the retry
-        /// failed, so the caller falls through to the chain. The retry sends the *original*
-        /// (uncompressed) request — the compressed body isn't retained past the forward — so the
-        /// row is recorded honestly as a no-savings turn.
+        /// failed, so the caller falls through to the chain. `Pending` is boxed on `Err` because
+        /// clippy 1.98's `result_large_err` rejects it on the stack (~816 bytes). The retry sends
+        /// the *original* (uncompressed) request — the compressed body isn't retained past the
+        /// forward — so the row is recorded honestly as a no-savings turn.
         async fn retry_anthropic_once(
             &self,
             mut pending: Pending,
             retry_after_secs: Option<u64>,
-        ) -> Result<Response<Body>, Pending> {
+        ) -> Result<Response<Body>, Box<Pending>> {
             let Some(original) = pending.original.clone() else {
-                return Err(pending);
+                return Err(Box::new(pending));
             };
             // A reset hint beyond the backoff cap (a usage limit hours away) means "don't wait" —
             // go straight to the chain, which is the whole point of fallback mode.
             let Some(wait_ms) = reroute_backoff_ms(0, retry_after_secs) else {
-                return Err(pending);
+                return Err(Box::new(pending));
             };
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            let proxy = self.upstream_proxy.clone();
-            let fetched =
-                tokio::task::spawn_blocking(move || fetch_original(&original, proxy.as_deref()))
-                    .await;
-            let Ok(Some((status, content_type, body))) = fetched else {
-                return Err(pending);
+            let fetched = fetch_original_with(&self.http, &original).await;
+            let Some((status, content_type, body)) = fetched else {
+                return Err(Box::new(pending));
             };
             if !(200..300).contains(&status) || is_sub_fallback_body(&body) {
-                return Err(pending);
+                return Err(Box::new(pending));
             }
             pending.input_after = pending.input_before;
             pending.output_shaped = false;
@@ -4044,19 +4182,11 @@ mod imp {
                 }
                 let url = state.url.clone();
                 let headers = state.headers.clone();
-                let proxy = self.upstream_proxy.clone();
-                let fetched = tokio::task::spawn_blocking(move || {
-                    use std::io::Read;
-                    let mut up =
-                        crate::transport::forward_post(&url, &headers, &json, proxy.as_deref())
-                            .ok()?;
-                    let mut body = Vec::new();
-                    up.reader.read_to_end(&mut body).ok()?;
-                    Some((up.status, up.content_type, body))
-                })
-                .await
-                .ok()
-                .flatten()?;
+                let fetched = self
+                    .http
+                    .post(&url, &headers, json.into_bytes())
+                    .await
+                    .map(|(status, content_type, _ra, body)| (status, content_type, body))?;
                 if !compact_should_retry(fetched.0) && !is_sub_fallback_body(&fetched.2) {
                     pending = next;
                     pending.model = Some(candidate.upstream_model.clone());
@@ -4162,7 +4292,7 @@ mod imp {
                     let hint = reroute_retry_after_from_headers(&parts.headers, &bytes);
                     match self.retry_anthropic_once(pending, hint).await {
                         Ok(response) => return response,
-                        Err(returned) => pending = returned,
+                        Err(returned) => pending = *returned,
                     }
                 }
                 return self.fallback_to_chain(pending, fb).await;
@@ -4210,13 +4340,7 @@ mod imp {
             let status = res.status();
             if should_replay(status.as_u16())
                 && let Some(original) = pending.original.clone()
-                && let Ok(Some(replayed)) = {
-                    let proxy = self.upstream_proxy.clone();
-                    tokio::task::spawn_blocking(move || {
-                        replay_original(&original, proxy.as_deref())
-                    })
-                    .await
-                }
+                && let Some(replayed) = replay_original_with(&self.http, &original).await
             {
                 eprintln!(
                     "llmtrim: upstream {} on compressed request — replayed original (no compression this call)",
@@ -4464,12 +4588,15 @@ mod imp {
                 }
             }
         }
-        let mut result = llmtrim_core::compress_with_config_model_and_recovery(
+        let mut result = llmtrim_core::compress_with_config_model_recovery_passthrough(
             text,
             Some(kind),
             config,
             model_override,
             recovery_hints,
+            llmtrim_core::config::RuntimeConfig::get()
+                .toolout_passthrough
+                .clone(),
         )
         .ok()?;
         // Replay previously-forwarded prefix bytes before deciding whether this turn has a net
@@ -5010,7 +5137,10 @@ mod imp {
                     .or_else(|| v.pointer("/message/usage/cache_read_input_tokens"))
                     .and_then(Value::as_i64),
                 ProviderKind::OpenAi => v
-                    .pointer("/usage/prompt_tokens_details/cached_tokens") // Chat Completions
+                    // DeepSeek's native cache split: `api.deepseek.com` is OpenAI-shaped but
+                    // reports these, not `prompt_tokens_details.cached_tokens`.
+                    .pointer("/usage/prompt_cache_hit_tokens")
+                    .or_else(|| v.pointer("/usage/prompt_tokens_details/cached_tokens")) // Chat Completions
                     .or_else(|| v.pointer("/usage/input_tokens_details/cached_tokens")) // Responses
                     .or_else(|| v.pointer("/response/usage/input_tokens_details/cached_tokens"))
                     .and_then(Value::as_i64),
@@ -5076,12 +5206,18 @@ mod imp {
                         .or_else(|| v.pointer("/response/usage/input_tokens"))
                         .and_then(Value::as_i64);
                     let cached = v
-                        .pointer("/usage/prompt_tokens_details/cached_tokens")
+                        .pointer("/usage/prompt_cache_hit_tokens")
+                        .or_else(|| v.pointer("/usage/prompt_tokens_details/cached_tokens"))
                         .or_else(|| v.pointer("/usage/input_tokens_details/cached_tokens"))
                         .or_else(|| v.pointer("/response/usage/input_tokens_details/cached_tokens"))
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
-                    (prompt.map(|p| (p - cached).max(0)), None)
+                    // DeepSeek reports the uncached remainder directly; elsewhere it is
+                    // `prompt_tokens - cached_tokens`.
+                    let miss = v
+                        .pointer("/usage/prompt_cache_miss_tokens")
+                        .and_then(Value::as_i64);
+                    (miss.or_else(|| prompt.map(|p| (p - cached).max(0))), None)
                 }
                 ProviderKind::Google => {
                     let prompt = v
@@ -5325,7 +5461,7 @@ mod imp {
             .map_err(|e| anyhow::anyhow!("failed to parse CA key: {e}"))?;
         let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert_pem, key)
             .map_err(|e| anyhow::anyhow!("failed to parse CA cert: {e}"))?;
-        let ca = LeafCertAuthority::new(issuer, aws_lc_rs::default_provider());
+        let ca = LeafCertAuthority::new(issuer, mitm_server_crypto_provider());
 
         // Ledger writes go to a dedicated thread (rusqlite isn't async); the handler just
         // sends Records over the channel.
@@ -5406,7 +5542,8 @@ mod imp {
                 .then(|| crate::recall::from_runtime(RuntimeConfig::get())),
             pending: None,
             streaming: false,
-            upstream_proxy: upstream_proxy.clone(),
+            http: BufferedHttp::new(upstream_proxy.as_deref())
+                .context("failed to build interceptor HTTP client")?,
             exclude_providers: Arc::new(exclusions.providers.clone()),
             exclude_hosts: Arc::new(exclusions.hosts.clone()),
             sub: {
@@ -5496,32 +5633,10 @@ mod imp {
         // proxy connector), so each branch calls .start().await directly rather than binding
         // a common variable.
         if let Some(ref upstream_url) = upstream_proxy {
-            let upstream_uri =
-                upstream_url
-                    .parse::<hudsucker::hyper::Uri>()
-                    .with_context(|| {
-                        format!(
-                            "failed to parse upstream proxy URI `{}`",
-                            crate::transport::redact_proxy_url(upstream_url)
-                        )
-                    })?;
-            let upstream_proxy_spec = UpstreamProxy::new(Intercept::All, upstream_uri);
-            // ProxyConnector has two distinct connection roles:
-            //  - Its INNER connector dials the PROXY itself. The upstream proxy is http://,
-            //    so a plain HttpConnector is correct — no TLS to the proxy.
-            //  - Its `tls` field wraps the ORIGIN connection that is tunnelled THROUGH the
-            //    CONNECT. This must perform full verifying TLS against the real origin
-            //    (openrouter.ai etc.) so the API key is never sent over a cleartext or
-            //    unverified channel.
-            //
-            // `from_proxy` (with the `rustls-tls-native-roots` feature active) builds a
-            // tokio-rustls TlsConnector for the origin leg using native roots and full cert
-            // verification. The tokio-rustls ClientConfig uses whatever CryptoProvider is
-            // installed at process start — we call aws_lc_rs::default_provider() at startup,
-            // so origin TLS automatically uses aws-lc-rs throughout.
-            let proxy_connector =
-                ProxyConnector::from_proxy(HttpConnector::new(), upstream_proxy_spec)
-                    .map_err(|e| anyhow::anyhow!("failed to build upstream ProxyConnector: {e}"))?;
+            // ProxyConnector inner connector dials the HTTP proxy; `tls` wraps the origin
+            // connection inside CONNECT. We replace the crate default (no ALPN) with
+            // `origin_tls_client_config` so the origin can negotiate HTTP/2.
+            let proxy_connector = upstream_proxy_connector(upstream_url)?;
             Proxy::builder()
                 .with_addr(addr)
                 .with_ca(ca)
@@ -5590,6 +5705,219 @@ mod imp {
         Ok(crate::daemon::home_dir()?.join("ca.hosts"))
     }
 
+    /// P-256 group order n/2. ECDSA signatures with s > n/2 are high-S: mathematically
+    /// valid, but *ring*/webpki reject them (OpenSSL/Node silently normalize).
+    const P256_HALF_N: [u8; 32] = [
+        0x7F, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xDE, 0x73, 0xD5, 0x56, 0xD3, 0x8B, 0xCF, 0x42, 0x79, 0xDC, 0xE5, 0x61, 0x7E, 0x31,
+        0x92, 0xA8,
+    ];
+
+    fn der_len(input: &[u8], i: &mut usize) -> Option<usize> {
+        let b = *input.get(*i)?;
+        *i += 1;
+        if b < 0x80 {
+            return Some(b as usize);
+        }
+        let n = (b & 0x7f) as usize;
+        if n == 0 || n > 3 {
+            return None;
+        }
+        let mut len = 0usize;
+        for _ in 0..n {
+            len = (len << 8) | (*input.get(*i)? as usize);
+            *i += 1;
+        }
+        Some(len)
+    }
+
+    fn der_tlv<'a>(input: &'a [u8], i: &mut usize) -> Option<(u8, &'a [u8])> {
+        let tag = *input.get(*i)?;
+        *i += 1;
+        let len = der_len(input, i)?;
+        let start = *i;
+        let end = start.checked_add(len)?;
+        if end > input.len() {
+            return None;
+        }
+        *i = end;
+        Some((tag, &input[start..end]))
+    }
+
+    fn int_be_padded32(bytes: &[u8]) -> Option<[u8; 32]> {
+        let mut v = bytes;
+        while v.first() == Some(&0) && v.len() > 1 {
+            v = &v[1..];
+        }
+        if v.len() > 32 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        out[32 - v.len()..].copy_from_slice(v);
+        Some(out)
+    }
+
+    fn p256_s_bytes_are_low(s: &[u8]) -> bool {
+        int_be_padded32(s).is_some_and(|sb| sb <= P256_HALF_N)
+    }
+
+    /// True for a P-256 ECDSA signature in X.509 ASN.1 or TLS 1.3 IEEE-P1363 (r||s) form.
+    fn p256_ecdsa_sig_is_low_s(sig: &[u8]) -> bool {
+        if sig.len() == 64 {
+            return p256_s_bytes_are_low(&sig[32..]);
+        }
+        let mut i = 0;
+        let Some((tag, body)) = der_tlv(sig, &mut i) else {
+            return false;
+        };
+        if tag != 0x30 {
+            return false;
+        }
+        let mut j = 0;
+        let Some((rt, _r)) = der_tlv(body, &mut j) else {
+            return false;
+        };
+        let Some((st, s)) = der_tlv(body, &mut j) else {
+            return false;
+        };
+        rt == 0x02 && st == 0x02 && p256_s_bytes_are_low(s)
+    }
+
+    const P256_N: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
+        0x25, 0x51,
+    ];
+
+    fn p256_n_minus(s: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0u16;
+        for i in (0..32).rev() {
+            let lhs = P256_N[i] as u16;
+            let rhs = s[i] as u16 + borrow;
+            if lhs >= rhs {
+                out[i] = (lhs - rhs) as u8;
+                borrow = 0;
+            } else {
+                out[i] = (lhs + 256 - rhs) as u8;
+                borrow = 1;
+            }
+        }
+        out
+    }
+
+    fn der_encode_int(be32: &[u8]) -> Vec<u8> {
+        let mut v = be32;
+        while v.len() > 1 && v[0] == 0 {
+            v = &v[1..];
+        }
+        let mut body = Vec::with_capacity(v.len() + 1);
+        if v[0] & 0x80 != 0 {
+            body.push(0);
+        }
+        body.extend_from_slice(v);
+        let mut out = Vec::with_capacity(2 + body.len());
+        out.push(0x02);
+        out.push(body.len() as u8);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Rewrite a P-256 ECDSA signature so `s ≤ n/2` (X.509 ASN.1 or TLS 1.3 raw r||s).
+    fn p256_ecdsa_sig_canonicalize(sig: Vec<u8>) -> Vec<u8> {
+        if sig.len() == 64 {
+            let s: [u8; 32] = sig[32..].try_into().expect("64-byte P-256 sig");
+            if p256_s_bytes_are_low(&s) {
+                return sig;
+            }
+            let mut out = sig;
+            out[32..].copy_from_slice(&p256_n_minus(&s));
+            return out;
+        }
+        let mut i = 0;
+        let Some((tag, body)) = der_tlv(&sig, &mut i) else {
+            return sig;
+        };
+        if tag != 0x30 {
+            return sig;
+        }
+        let mut j = 0;
+        let Some((rt, r)) = der_tlv(body, &mut j) else {
+            return sig;
+        };
+        let Some((st, s)) = der_tlv(body, &mut j) else {
+            return sig;
+        };
+        if rt != 0x02 || st != 0x02 {
+            return sig;
+        }
+        let Some(sb) = int_be_padded32(s) else {
+            return sig;
+        };
+        if p256_s_bytes_are_low(&sb) {
+            return sig;
+        }
+        let s_low = p256_n_minus(&sb);
+        let r_der = der_encode_int(r);
+        let s_der = der_encode_int(&s_low);
+        let mut seq = Vec::with_capacity(r_der.len() + s_der.len());
+        seq.extend_from_slice(&r_der);
+        seq.extend_from_slice(&s_der);
+        let mut out = Vec::with_capacity(2 + seq.len());
+        out.push(0x30);
+        out.push(seq.len() as u8);
+        out.extend_from_slice(&seq);
+        out
+    }
+
+    fn cert_p256_sig_is_low_s(cert_der: &[u8]) -> bool {
+        let mut i = 0;
+        let Some((tag, body)) = der_tlv(cert_der, &mut i) else {
+            return false;
+        };
+        if tag != 0x30 {
+            return false;
+        }
+        let mut j = 0;
+        let Some(_) = der_tlv(body, &mut j) else {
+            return false;
+        };
+        let Some(_) = der_tlv(body, &mut j) else {
+            return false;
+        };
+        let Some((btag, bits)) = der_tlv(body, &mut j) else {
+            return false;
+        };
+        btag == 0x03 && bits.len() > 1 && p256_ecdsa_sig_is_low_s(&bits[1..])
+    }
+
+    fn pem_cert_der(pem: &str) -> Option<Vec<u8>> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let start = pem.find("-----BEGIN CERTIFICATE-----")?;
+        let rest = &pem[start + "-----BEGIN CERTIFICATE-----".len()..];
+        let end = rest.find("-----END CERTIFICATE-----")?;
+        let b64: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
+        STANDARD.decode(b64).ok()
+    }
+
+    fn pem_cert_is_p256_low_s(pem: &str) -> bool {
+        pem_cert_der(pem).is_some_and(|d| cert_p256_sig_is_low_s(&d))
+    }
+
+    fn mint_p256_until_low_s(
+        mint: impl Fn() -> Result<hudsucker::rcgen::Certificate>,
+    ) -> Result<hudsucker::rcgen::Certificate> {
+        // rcgen's ring backend (and aws-lc) can emit high-S. ECDSA `k` is fresh each
+        // attempt, so P(high-S) ≤ 1/2 per try.
+        for _ in 0..32 {
+            let cert = mint()?;
+            if cert_p256_sig_is_low_s(cert.der().as_ref()) {
+                return Ok(cert);
+            }
+        }
+        anyhow::bail!("failed to mint a canonical low-S ECDSA P-256 certificate")
+    }
+
     /// The domains the persisted CA was built for, from its sidecar (one per line). `None` when
     /// there is no sidecar (a CA from before sidecars existed, or no CA at all).
     fn read_ca_hosts() -> Option<Vec<String>> {
@@ -5627,10 +5955,13 @@ mod imp {
         let have_ca = cert_path.exists() && key_path.exists();
         let expected = intercept_domains();
         if ca_is_current(have_ca, read_ca_hosts().as_deref(), &expected) {
-            return Ok((
-                std::fs::read_to_string(&cert_path)?,
-                std::fs::read_to_string(&key_path)?,
-            ));
+            let cert_pem = std::fs::read_to_string(&cert_path)?;
+            let key_pem = std::fs::read_to_string(&key_path)?;
+            // Issue #290: a CA minted with high-S ECDSA is persisted until the host set
+            // changes. ring-based clients reject it even after NODE_EXTRA_CA_CERTS trust.
+            if pem_cert_is_p256_low_s(&cert_pem) {
+                return Ok((cert_pem, key_pem));
+            }
         }
         let (cert_pem, key_pem) = generate_ca(&expected)?;
         let dir = crate::daemon::home_dir()?;
@@ -5658,12 +5989,13 @@ mod imp {
         std::fs::write(ca_hosts_path()?, expected.join("\n"))
             .with_context(|| "failed to write CA host sidecar")?;
         if have_ca {
-            // Regenerated over an existing CA because the host set changed. Env-trusting tools
-            // follow the file automatically; any OS trust-store copy is now stale.
+            // Regenerated over an existing CA (host set changed, or a high-S ECDSA
+            // signature that ring/webpki reject). Env-trusting tools follow the file;
+            // any OS trust-store copy is now stale.
             eprintln!(
-                "llmtrim: CA updated for a changed provider-host set. Tools trusting it via \
-                 NODE_EXTRA_CA_CERTS pick it up on relaunch; if you trusted it system-wide \
-                 (GUI apps), re-trust it — see `llmtrim ca`."
+                "llmtrim: CA updated. Tools trusting it via NODE_EXTRA_CA_CERTS pick it up \
+                 on relaunch; if you trusted it system-wide (GUI apps), re-trust it — see \
+                 `llmtrim ca`."
             );
         }
         Ok((cert_pem, key_pem))
@@ -5694,10 +6026,77 @@ mod imp {
                 .collect(),
             excluded_subtrees: vec![],
         });
-        let cert = params
-            .self_signed(&key)
-            .map_err(|e| anyhow::anyhow!("CA self-sign failed: {e}"))?;
+        let cert = mint_p256_until_low_s(|| {
+            params
+                .self_signed(&key)
+                .map_err(|e| anyhow::anyhow!("CA self-sign failed: {e}"))
+        })?;
         Ok((cert.pem(), key.serialize_pem()))
+    }
+
+    /// rustls `ring`/`aws-lc-rs` ECDSA signers may emit high-S. Wrap them so CertificateVerify
+    /// is always canonical (ring/webpki clients otherwise fail the handshake, #290).
+    #[derive(Debug)]
+    struct LowSKeyProvider;
+
+    static LOW_S_KEY_PROVIDER: LowSKeyProvider = LowSKeyProvider;
+
+    impl KeyProvider for LowSKeyProvider {
+        fn load_private_key(
+            &self,
+            key_der: PrivateKeyDer<'static>,
+        ) -> Result<Arc<dyn SigningKey>, rustls::Error> {
+            let inner = rustls_ring::default_provider()
+                .key_provider
+                .load_private_key(key_der)?;
+            Ok(Arc::new(LowSSigningKey(inner)))
+        }
+    }
+
+    struct LowSSigningKey(Arc<dyn SigningKey>);
+
+    impl std::fmt::Debug for LowSSigningKey {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("LowSSigningKey").finish()
+        }
+    }
+
+    impl SigningKey for LowSSigningKey {
+        fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+            Some(Box::new(LowSSigner(self.0.choose_scheme(offered)?)))
+        }
+
+        fn algorithm(&self) -> SignatureAlgorithm {
+            self.0.algorithm()
+        }
+
+        fn public_key(&self) -> Option<hudsucker::rustls::pki_types::SubjectPublicKeyInfoDer<'_>> {
+            self.0.public_key()
+        }
+    }
+
+    struct LowSSigner(Box<dyn Signer>);
+
+    impl std::fmt::Debug for LowSSigner {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("LowSSigner").finish()
+        }
+    }
+
+    impl Signer for LowSSigner {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+            Ok(p256_ecdsa_sig_canonicalize(self.0.sign(message)?))
+        }
+
+        fn scheme(&self) -> SignatureScheme {
+            self.0.scheme()
+        }
+    }
+
+    fn mitm_server_crypto_provider() -> CryptoProvider {
+        let mut provider = rustls_ring::default_provider();
+        provider.key_provider = &LOW_S_KEY_PROVIDER;
+        provider
     }
 
     /// MITM leaf-certificate authority: a drop-in for hudsucker's `RcgenAuthority` that adds the
@@ -5711,6 +6110,10 @@ mod imp {
     /// CA, cached in memory. `RcgenAuthority::new` exposes no hook for these extensions and 0.24
     /// is the latest published version, and llmtrim publishes to crates.io (so a git-patched
     /// hudsucker is not an option), hence the small in-tree copy.
+    ///
+    /// TLS `ServerConfig`s are built with rustls' `ring` provider so CertificateVerify is
+    /// canonical low-S ECDSA — aws-lc-rs (used for origin TLS) may emit high-S, which
+    /// ring/webpki clients reject (#290).
     ///
     /// TODO: drop this and go back to `RcgenAuthority` once hudsucker mints leaves with an
     /// Authority Key Identifier (or exposes a hook to set leaf extensions). Tracking upstream at
@@ -5782,10 +6185,13 @@ mod imp {
             // stricter stacks (LibreSSL, corporate TLS inspectors) want it.
             params.is_ca = IsCa::ExplicitNoCa;
 
-            params
-                .signed_by(self.issuer.key(), &self.issuer)
-                .expect("failed to sign leaf certificate")
-                .into()
+            mint_p256_until_low_s(|| {
+                params
+                    .signed_by(self.issuer.key(), &self.issuer)
+                    .map_err(|e| anyhow::anyhow!("failed to sign leaf certificate: {e}"))
+            })
+            .expect("failed to sign leaf certificate")
+            .into()
         }
     }
 
@@ -6661,6 +7067,23 @@ mod imp {
         }
 
         #[test]
+        fn deepseek_native_cache_fields_are_read() {
+            let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":10,
+                "prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}}"#;
+            assert_eq!(extract_cache_read(ProviderKind::OpenAi, body), Some(800));
+            let (fresh, write) = extract_input_usage(ProviderKind::OpenAi, body);
+            assert_eq!(fresh, Some(200));
+            assert_eq!(write, None);
+
+            // Without DeepSeek's fields the OpenAI arithmetic still applies.
+            let openai = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":700}}}"#;
+            assert_eq!(extract_cache_read(ProviderKind::OpenAi, openai), Some(700));
+            let (fresh, _) = extract_input_usage(ProviderKind::OpenAi, openai);
+            assert_eq!(fresh, Some(300));
+        }
+
+        #[test]
         fn output_usage_reads_provider_counts() {
             // Anthropic SSE: message_start has a partial count, message_delta the true total.
             let anthropic_sse = concat!(
@@ -6807,7 +7230,7 @@ mod imp {
             let (cert_pem, key_pem) = generate_ca(&intercept_domains()).unwrap();
             let key = hudsucker::rcgen::KeyPair::from_pem(&key_pem).unwrap();
             let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert_pem, key).unwrap();
-            let ca = LeafCertAuthority::new(issuer, aws_lc_rs::default_provider());
+            let ca = LeafCertAuthority::new(issuer, mitm_server_crypto_provider());
             let der = ca.gen_cert("example.com");
             let bytes: &[u8] = der.as_ref();
             let has = |oid: &[u8]| bytes.windows(oid.len()).any(|w| w == oid);
@@ -6824,6 +7247,63 @@ mod imp {
                 has(&[0x06, 0x03, 0x55, 0x1D, 0x25]),
                 "leaf must carry Extended Key Usage (2.5.29.37)"
             );
+        }
+
+        #[test]
+        fn minted_ca_and_leaf_are_low_s_and_verify_with_ring_webpki() {
+            // Issue #290: ring/webpki reject high-S ECDSA. The CA and each MITM leaf must
+            // verify with the ring algorithms a rustls+ring client uses.
+            let (cert_pem, key_pem) = generate_ca(&intercept_domains()).unwrap();
+            assert!(
+                pem_cert_is_p256_low_s(&cert_pem),
+                "CA self-signature must be canonical low-S ECDSA"
+            );
+            let key = hudsucker::rcgen::KeyPair::from_pem(&key_pem).unwrap();
+            let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert_pem, key).unwrap();
+            let ca = LeafCertAuthority::new(issuer, mitm_server_crypto_provider());
+            let leaf = ca.gen_cert("api.openai.com");
+            assert!(
+                cert_p256_sig_is_low_s(leaf.as_ref()),
+                "leaf signature must be canonical low-S ECDSA"
+            );
+
+            let ca_der = pem_cert_der(&cert_pem).expect("CA PEM");
+            let ca_der = CertificateDer::from(ca_der);
+            let ta = webpki::anchor_from_trusted_cert(&ca_der).expect("trust anchor");
+            let ee = webpki::EndEntityCert::try_from(&leaf).expect("parse leaf");
+            ee.verify_for_usage(
+                &[webpki::ring::ECDSA_P256_SHA256],
+                &[ta],
+                &[],
+                hudsucker::rustls::pki_types::UnixTime::now(),
+                webpki::KeyUsage::server_auth(),
+                None,
+                None,
+            )
+            .expect("ring/webpki must accept the MITM chain");
+        }
+
+        #[test]
+        fn mitm_server_key_signs_low_s_with_ring_provider() {
+            let (cert_pem, key_pem) = generate_ca(&intercept_domains()).unwrap();
+            let key = hudsucker::rcgen::KeyPair::from_pem(&key_pem).unwrap();
+            let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert_pem, key).unwrap();
+            let ca = LeafCertAuthority::new(issuer, mitm_server_crypto_provider());
+            let signing = mitm_server_crypto_provider()
+                .key_provider
+                .load_private_key(ca.private_key.clone_key())
+                .expect("load MITM server key");
+            let signer = signing
+                .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+                .expect("p256 scheme");
+            for i in 0..32 {
+                let sig = signer.sign(b"tls13-certificate-verify-test").expect("sign");
+                assert!(
+                    p256_ecdsa_sig_is_low_s(&sig),
+                    "handshake signature {i} must be canonical low-S (len={})",
+                    sig.len()
+                );
+            }
         }
 
         #[test]
@@ -7011,6 +7491,7 @@ mod imp {
                 "/v1/messages/count_tokens",
                 "/v1beta/models/gemini-2.0-flash:countTokens",
                 "/v1/audio/transcriptions",
+                "/api/ws/speech_to_text/voice_stream",
             ] {
                 assert!(!is_compressible_path(skip), "must NOT compress {skip}");
             }
@@ -7460,7 +7941,7 @@ mod imp {
                 recall: None,
                 pending: None,
                 streaming: false,
-                upstream_proxy: None,
+                http: BufferedHttp::new(None).expect("test HTTP client"),
                 exclude_hosts: Arc::new(Vec::new()),
                 exclude_providers: Arc::new(Vec::new()),
                 sub: None,
@@ -7566,6 +8047,16 @@ mod imp {
                 .expect("valid request")
         }
 
+        fn websocket_get(uri: &str) -> Request<Body> {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::UPGRADE, "websocket")
+                .header(header::CONNECTION, "Upgrade")
+                .body(Body::empty())
+                .expect("valid request")
+        }
+
         fn get_request_bearer(uri: &str, token: &str) -> Request<Body> {
             Request::builder()
                 .method(Method::GET)
@@ -7584,9 +8075,8 @@ mod imp {
         /// exactly one connection, reads (discards) the request, then writes the given
         /// status line and response body. Returns the bound port immediately.
         ///
-        /// Because `replay_original` calls `transport::forward_post` (blocking ureq),
-        /// the server is a plain `std::thread` — the OS TCP accept is the synchronization
-        /// primitive, no sleeps needed.
+        /// Replay talks HTTP/1.1 to this stub via the async hyper client; a `std::thread`
+        /// server is enough — the OS TCP accept is the synchronization primitive.
         fn stub_http_server(status_line: &str, response_body: &str) -> u16 {
             use std::io::{Read, Write};
             use std::net::TcpListener;
@@ -7806,39 +8296,81 @@ mod imp {
 
         #[test]
         fn is_websocket_upgrade_detects_h1_upgrade_header() {
-            let ws = Request::builder()
-                .method(Method::GET)
-                .uri("https://chatgpt.com/backend-api/codex/responses")
-                .header(header::UPGRADE, "websocket")
-                .header(header::CONNECTION, "Upgrade")
-                .body(Body::empty())
-                .expect("valid request");
+            let ws = websocket_get("https://chatgpt.com/backend-api/codex/responses");
             assert!(is_websocket_upgrade(&ws));
+            assert!(should_refuse_websocket(&ws));
+
+            let dictation =
+                websocket_get("https://api.anthropic.com/api/ws/speech_to_text/voice_stream");
+            assert!(is_websocket_upgrade(&dictation));
+            assert!(
+                !should_refuse_websocket(&dictation),
+                "dictation has no HTTPS fallback; refusing it kills the microphone"
+            );
 
             let plain = post_request("https://api.openai.com/v1/chat/completions", "{}");
             assert!(!is_websocket_upgrade(&plain));
+            assert!(!should_refuse_websocket(&plain));
         }
 
-        /// A WebSocket upgrade on an intercepted host is short-circuited with 426 so the client
-        /// falls back to the compressible HTTPS transport — never forwarded, never compressed.
+        /// A WebSocket upgrade on a prompt-bearing path is short-circuited with 426 so the
+        /// client falls back to the compressible HTTPS transport — never forwarded, never
+        /// compressed. Codex `/responses` is the motivating case.
         #[tokio::test]
         async fn handle_request_inner_refuses_websocket_upgrade_with_426() {
             let (mut handler, rx) = make_interceptor();
-            let req = Request::builder()
-                .method(Method::GET)
-                .uri("https://chatgpt.com/backend-api/codex/responses")
-                .header(header::UPGRADE, "websocket")
-                .header(header::CONNECTION, "Upgrade")
-                .body(Body::empty())
-                .expect("valid request");
+            let req = websocket_get("https://chatgpt.com/backend-api/codex/responses");
 
             let result = handler.handle_request_inner(req).await;
 
             let RequestOrResponse::Response(res) = result else {
-                panic!("a WebSocket upgrade must be refused with a Response, not forwarded");
+                panic!(
+                    "a prompt-bearing WebSocket upgrade must be refused with a Response, not forwarded"
+                );
             };
             assert_eq!(res.status(), hudsucker::hyper::StatusCode::UPGRADE_REQUIRED);
             // Refusal is not a compressed request: no pending state, no ledger record.
+            assert!(handler.pending.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+
+        /// Claude Code dictation (`wss://api.anthropic.com/api/ws/speech_to_text/voice_stream`)
+        /// has no HTTPS fallback. Refusing it with 426 kills the microphone (#282). Forward
+        /// the upgrade so hudsucker can tunnel it; do not compress, do not ledger.
+        #[tokio::test]
+        async fn handle_request_inner_forwards_anthropic_dictation_websocket() {
+            let (mut handler, rx) = make_interceptor();
+            let req = websocket_get("https://api.anthropic.com/api/ws/speech_to_text/voice_stream");
+
+            let result = handler.handle_request_inner(req).await;
+
+            let RequestOrResponse::Request(out) = result else {
+                panic!("dictation WebSocket must be forwarded, not refused with 426");
+            };
+            assert_eq!(out.uri().path(), "/api/ws/speech_to_text/voice_stream");
+            assert!(handler.pending.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+
+        /// hudsucker treats CONNECT as an HTTP tunnel, so an h2 Extended CONNECT websocket
+        /// would stall. Refuse even on a non-compressible path (dictation) rather than hang.
+        #[tokio::test]
+        async fn handle_request_inner_refuses_h2_websocket_connect_on_dictation_path() {
+            let (mut handler, rx) = make_interceptor();
+            let mut req = Request::builder()
+                .method(Method::CONNECT)
+                .uri("https://api.anthropic.com/api/ws/speech_to_text/voice_stream")
+                .body(Body::empty())
+                .expect("valid request");
+            req.extensions_mut()
+                .insert(hudsucker::hyper::ext::Protocol::from_static("websocket"));
+
+            let result = handler.handle_request_inner(req).await;
+
+            let RequestOrResponse::Response(res) = result else {
+                panic!("h2 Extended CONNECT must be refused with 426, not forwarded");
+            };
+            assert_eq!(res.status(), hudsucker::hyper::StatusCode::UPGRADE_REQUIRED);
             assert!(handler.pending.is_none());
             assert!(rx.try_recv().is_err());
         }
@@ -8661,27 +9193,28 @@ mod imp {
         // What the test guarantees: if someone reverts `from_proxy` to `from_proxy_unsecured`,
         // the test catches it immediately.
         #[test]
-        fn proxy_connector_origin_tls_is_active() {
-            // ProxyConnector::from_proxy internally builds a tokio-rustls ClientConfig.
-            // tokio-rustls requires a CryptoProvider to be installed; we use the same
-            // aws-lc-rs provider that production installs at daemon startup.
+        fn origin_tls_config_advertises_h2_alpn() {
             let _ = aws_lc_rs::default_provider().install_default();
+            let cfg = origin_tls_client_config_with_alpn().expect("origin TLS config");
+            assert_eq!(
+                cfg.alpn_protocols,
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                "origin TLS must offer HTTP/2 then HTTP/1.1"
+            );
+        }
 
-            let proxy_uri: hudsucker::hyper::Uri = "http://proxy.example.test:3128"
-                .parse()
-                .expect("test proxy URI");
-            let upstream_proxy_spec = UpstreamProxy::new(Intercept::All, proxy_uri);
-            let connector = ProxyConnector::from_proxy(HttpConnector::new(), upstream_proxy_spec)
-                .expect("ProxyConnector::from_proxy must succeed");
+        #[test]
+        fn proxy_connector_origin_tls_is_active() {
+            // tokio-rustls requires a CryptoProvider; same aws-lc-rs as production.
+            let _ = aws_lc_rs::default_provider().install_default();
+            let connector = upstream_proxy_connector("http://proxy.example.test:3128")
+                .expect("upstream_proxy_connector must succeed");
 
             // hyper-http-proxy's Debug impl emits "(unsecured)" only when `tls` is None.
-            // Assert its absence to confirm the origin leg has a verifying TLS connector.
             let debug_str = format!("{connector:?}");
             assert!(
                 !debug_str.contains("(unsecured)"),
-                "ProxyConnector must have a TLS connector for the origin leg \
-                 (built with from_proxy, not from_proxy_unsecured). \
-                 Debug output: {debug_str}"
+                "ProxyConnector must have a TLS connector for the origin leg (from_proxy + set_tls). Debug: {debug_str}"
             );
         }
     }
